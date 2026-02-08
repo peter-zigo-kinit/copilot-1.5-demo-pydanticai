@@ -1,73 +1,39 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, TypedDict
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any
 
-from ag_ui.core import AssistantMessage, RunAgentInput, UserMessage
+from ag_ui.core import RunAgentInput
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from sqlalchemy import delete, func
+from sqlmodel import SQLModel, Session, select
 
 from pydantic_ai.ag_ui import SSE_CONTENT_TYPE, run_ag_ui
+from pydantic import TypeAdapter
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, UserPromptPart
 from pydantic_ai.ui.ag_ui._adapter import AGUIAdapter
 
-from agent import ProverbsState, StateDeps, agent
-
-
-class ThreadRecord(TypedDict):
-    title: str
-    messages: list[ModelMessage]
-    state: dict[str, Any]
-    agui_message_ids: set[str]
-
-
-def _build_thread(
-    *,
-    title: str,
-    state: dict[str, Any],
-    agui_messages: list[UserMessage | AssistantMessage],
-) -> ThreadRecord:
-    return {
-        "title": title,
-        "messages": AGUIAdapter.load_messages(agui_messages),
-        "state": state,
-        "agui_message_ids": {message.id for message in agui_messages},
-    }
-
-
-THREADS: dict[str, ThreadRecord] = {
-    "thread-1": _build_thread(
-        title="Proverbs A",
-        state={"proverbs": ["A stitch in time saves nine."]},
-        agui_messages=[
-            UserMessage(id="t1-user-1", content="Add a proverb about time."),
-            AssistantMessage(id="t1-assistant-1", content="Added: A stitch in time saves nine."),
-        ],
-    ),
-    "thread-2": _build_thread(
-        title="Proverbs B",
-        state={"proverbs": ["Measure twice, cut once."]},
-        agui_messages=[
-            UserMessage(id="t2-user-1", content="Give me a proverb about planning."),
-            AssistantMessage(id="t2-assistant-1", content="Measure twice, cut once."),
-        ],
-    ),
-    "thread-3": _build_thread(
-        title="Proverbs C",
-        state={"proverbs": []},
-        agui_messages=[
-            UserMessage(id="t3-user-1", content="Start a new list of proverbs."),
-            AssistantMessage(id="t3-assistant-1", content="Started a new list with zero items."),
-        ],
-    ),
-}
+from agent import MLState, StateDeps, agent
+from db import engine
+from models import Message, State, Thread, ThreadMetadata
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("threads")
 
+ModelMessageAdapter = TypeAdapter(ModelMessage)
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    SQLModel.metadata.create_all(engine)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -78,14 +44,21 @@ app.add_middleware(
 
 @app.get("/threads")
 def list_threads() -> list[dict[str, Any]]:
-    return [
-        {
-            "thread_id": thread_id,
-            "title": record["title"],
-            "message_count": len(record["messages"]),
-        }
-        for thread_id, record in THREADS.items()
-    ]
+    with Session(engine) as session:
+        threads = session.exec(select(Thread).order_by(Thread.updated_at.desc())).all()
+        response: list[dict[str, Any]] = []
+        for thread in threads:
+            message_count = session.exec(
+                select(func.count(Message.id)).where(Message.thread_id == thread.id)
+            ).one()
+            response.append(
+                {
+                    "thread_id": str(thread.id),
+                    "title": thread.title,
+                    "message_count": message_count,
+                }
+            )
+        return response
 
 
 def _model_messages_to_chat(messages: list[ModelMessage], thread_id: str) -> list[dict[str, Any]]:
@@ -118,42 +91,80 @@ def _model_messages_to_chat(messages: list[ModelMessage], thread_id: str) -> lis
 
 @app.get("/threads/{thread_id}")
 def get_thread(thread_id: str) -> dict[str, Any]:
-    record = THREADS.get(thread_id)
-    if not record:
-        return {"thread_id": thread_id, "title": "New thread", "state": {"proverbs": []}}
-    return {"thread_id": thread_id, "title": record["title"], "state": record["state"]}
+    with Session(engine) as session:
+        thread_uuid = _parse_thread_id(thread_id)
+        if not thread_uuid:
+            return {
+                "thread_id": thread_id,
+                "title": "New thread",
+                "state": MLState().model_dump(),
+            }
+        thread = session.get(Thread, thread_uuid)
+        if not thread:
+            return {
+                "thread_id": thread_id,
+                "title": "New thread",
+                "state": MLState().model_dump(),
+            }
+        state = session.exec(select(State).where(State.thread_id == thread.id)).first()
+        return {
+            "thread_id": str(thread.id),
+            "title": thread.title,
+            "state": state.state_json if state else MLState().model_dump(),
+        }
 
 
 @app.get("/threads/{thread_id}/messages")
 def get_thread_messages(thread_id: str) -> list[dict[str, Any]]:
-    record = THREADS.get(thread_id)
-    if not record:
-        return []
-    chat_messages = _model_messages_to_chat(record["messages"], thread_id)
-    logger.info("Thread %s history requested, returning %s messages", thread_id, len(chat_messages))
-    return chat_messages
+    with Session(engine) as session:
+        thread_uuid = _parse_thread_id(thread_id)
+        if not thread_uuid:
+            return []
+        thread = session.get(Thread, thread_uuid)
+        if not thread:
+            return []
+        stored_messages = session.exec(
+            select(Message).where(Message.thread_id == thread.id).order_by(Message.created_at)
+        ).all()
+        model_messages = [
+            ModelMessageAdapter.validate_python(message.message_json)
+            for message in stored_messages
+        ]
+        chat_messages = _model_messages_to_chat(model_messages, thread_id)
+        logger.info("Thread %s history requested, returning %s messages", thread_id, len(chat_messages))
+        return chat_messages
 
 
 @app.post("/agent")
 async def ag_ui_endpoint(request: Request) -> StreamingResponse:
     run_input = RunAgentInput.model_validate_json(await request.body())
-    is_new_thread = run_input.thread_id not in THREADS
-    record = THREADS.setdefault(
-        run_input.thread_id,
-        {
-            "title": f"Thread {run_input.thread_id}",
-            "messages": [],
-            "state": {"proverbs": []},
-            "agui_message_ids": set(),
-        },
-    )
-    if is_new_thread:
+    session = Session(engine)
+    thread_uuid = _parse_thread_id(run_input.thread_id)
+    if not thread_uuid:
+        thread_uuid = uuid.uuid5(uuid.NAMESPACE_URL, run_input.thread_id)
+    thread = session.get(Thread, thread_uuid)
+    if not thread:
+        thread = Thread(id=thread_uuid, user_id="demo-user", title=f"Thread {run_input.thread_id}")
+        session.add(thread)
+        session.add(State(thread_id=thread.id, state_json=MLState().model_dump()))
+        session.commit()
         logger.info("Thread %s created", run_input.thread_id)
 
-    known_ids = record["agui_message_ids"]
+    state_row = session.exec(select(State).where(State.thread_id == thread.id)).first()
+    stored_state = state_row.state_json if state_row else MLState().model_dump()
+
+    metadata = thread.thread_metadata or ThreadMetadata()
+    known_ids = set((metadata.custom_data or {}).get("known_message_ids", []))
     new_agui_messages = [message for message in run_input.messages if message.id not in known_ids]
     if new_agui_messages:
         known_ids.update(message.id for message in new_agui_messages)
+        metadata.custom_data = {
+            **(metadata.custom_data or {}),
+            "known_message_ids": list(known_ids),
+        }
+        thread.thread_metadata = metadata
+        session.add(thread)
+        session.commit()
         logger.info(
             "Thread %s received %s new messages (known=%s)",
             run_input.thread_id,
@@ -161,25 +172,43 @@ async def ag_ui_endpoint(request: Request) -> StreamingResponse:
             len(known_ids),
         )
 
-    stored_messages = record["messages"]
-    message_history = stored_messages
+    stored_messages = session.exec(
+        select(Message).where(Message.thread_id == thread.id).order_by(Message.created_at)
+    ).all()
+    model_messages = [
+        ModelMessageAdapter.validate_python(message.message_json)
+        for message in stored_messages
+    ]
+    message_history = model_messages
     if new_agui_messages:
         incoming_messages = AGUIAdapter.load_messages(new_agui_messages)
-        message_history = [*stored_messages, *incoming_messages]
+        message_history = [*model_messages, *incoming_messages]
 
     run_input = run_input.model_copy(update={"messages": new_agui_messages})
 
-    deps = StateDeps(ProverbsState.model_validate(record["state"]))
+    deps = StateDeps(MLState.model_validate(stored_state))
 
     def on_complete(result: Any) -> None:
-        record["messages"] = result.all_messages()
-        if isinstance(deps.state, ProverbsState):
-            record["state"] = deps.state.model_dump()
+        session.exec(delete(Message).where(Message.thread_id == thread.id))
+        for message in result.all_messages():
+            session.add(
+                Message(
+                    thread_id=thread.id,
+                    message_json=ModelMessageAdapter.dump_python(message, mode="json"),
+                )
+            )
+        if state_row:
+            state_row.state_json = deps.state.model_dump()
+            session.add(state_row)
+        else:
+            session.add(State(thread_id=thread.id, state_json=deps.state.model_dump()))
+        session.commit()
         logger.info(
-            "Thread %s stored messages=%s state_proverbs=%s",
+            "Thread %s stored messages=%s state_tasks=%s datasets=%s",
             run_input.thread_id,
-            len(record["messages"]),
-            len(record["state"].get("proverbs", [])),
+            len(result.all_messages()),
+            len(deps.state.tasks),
+            len(deps.state.datasets),
         )
 
     accept = request.headers.get("accept", SSE_CONTENT_TYPE)
@@ -191,7 +220,22 @@ async def ag_ui_endpoint(request: Request) -> StreamingResponse:
         deps=deps,
         on_complete=on_complete,
     )
-    return StreamingResponse(stream, media_type=accept)
+
+    async def stream_with_session():
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            session.close()
+
+    return StreamingResponse(stream_with_session(), media_type=accept)
+
+
+def _parse_thread_id(thread_id: str) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(thread_id)
+    except ValueError:
+        return None
 
 
 if __name__ == "__main__":

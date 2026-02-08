@@ -12,27 +12,32 @@ load_dotenv()
 # =====
 # State
 # =====
-class ProverbsState(BaseModel):
-  """List of the proverbs being written."""
-  proverbs: list[str] = Field(
-    default_factory=list,
-    description='The list of already written proverbs',
-  )
+class TaskItem(BaseModel):
+  name: str
+  status: str = Field(default="pending")
+
+
+class DatasetItem(BaseModel):
+  name: str
+  status: str = Field(default="pending")
+
+
+class MLState(BaseModel):
+  """Tracks ML tasks and datasets with statuses."""
+  tasks: list[TaskItem] = Field(default_factory=list)
+  datasets: list[DatasetItem] = Field(default_factory=list)
 
 # =====
 # Agent
 # =====
 agent = Agent(
   model = OpenAIResponsesModel('gpt-4.1-mini'),
-  deps_type=StateDeps[ProverbsState],
+  deps_type=StateDeps[MLState],
   system_prompt=dedent("""
-    You are a helpful assistant that helps manage and discuss proverbs.
+    You are a helpful assistant that helps manage machine learning tasks and datasets.
     
-    The user has a list of proverbs that you can help them manage.
-    You have tools available to add, set, or retrieve proverbs from the list.
-    
-    When discussing proverbs, ALWAYS use the get_proverbs tool to see the current list before
-    mentioning, updating, or discussing proverbs with the user.
+    The user tracks tasks and datasets with statuses. Use the tools to list or update
+    tasks and datasets before referencing them in your response.
   """).strip()
 )
 
@@ -40,22 +45,22 @@ agent = Agent(
 # Tools
 # =====
 @agent.tool
-def get_proverbs(ctx: RunContext[StateDeps[ProverbsState]]) -> list[str]:
-  """Get the current list of proverbs."""
-  print(f"📖 Getting proverbs: {ctx.deps.state.proverbs}")
-  return ctx.deps.state.proverbs
+def get_tasks(ctx: RunContext[StateDeps[MLState]]) -> list[TaskItem]:
+  """Get the current list of ML tasks."""
+  print(f"🧠 Getting tasks: {ctx.deps.state.tasks}")
+  return ctx.deps.state.tasks
 
 @agent.tool
-async def add_proverbs(ctx: RunContext[StateDeps[ProverbsState]], proverbs: list[str]) -> StateSnapshotEvent:
-  ctx.deps.state.proverbs.extend(proverbs)
+async def add_tasks(ctx: RunContext[StateDeps[MLState]], tasks: list[TaskItem]) -> StateSnapshotEvent:
+  ctx.deps.state.tasks.extend(tasks)
   return StateSnapshotEvent(
     type=EventType.STATE_SNAPSHOT,
     snapshot=ctx.deps.state,
   )
 
 @agent.tool
-async def set_proverbs(ctx: RunContext[StateDeps[ProverbsState]], proverbs: list[str]) -> StateSnapshotEvent:
-  ctx.deps.state.proverbs = proverbs
+async def set_tasks(ctx: RunContext[StateDeps[MLState]], tasks: list[TaskItem]) -> StateSnapshotEvent:
+  ctx.deps.state.tasks = tasks
   return StateSnapshotEvent(
     type=EventType.STATE_SNAPSHOT,
     snapshot=ctx.deps.state,
@@ -63,6 +68,31 @@ async def set_proverbs(ctx: RunContext[StateDeps[ProverbsState]], proverbs: list
 
 
 @agent.tool
-def get_weather(_: RunContext[StateDeps[ProverbsState]], location: str) -> str:
+def get_datasets(ctx: RunContext[StateDeps[MLState]]) -> list[DatasetItem]:
+  """Get the current list of datasets."""
+  print(f"📊 Getting datasets: {ctx.deps.state.datasets}")
+  return ctx.deps.state.datasets
+
+
+@agent.tool
+async def add_datasets(ctx: RunContext[StateDeps[MLState]], datasets: list[DatasetItem]) -> StateSnapshotEvent:
+  ctx.deps.state.datasets.extend(datasets)
+  return StateSnapshotEvent(
+    type=EventType.STATE_SNAPSHOT,
+    snapshot=ctx.deps.state,
+  )
+
+
+@agent.tool
+async def set_datasets(ctx: RunContext[StateDeps[MLState]], datasets: list[DatasetItem]) -> StateSnapshotEvent:
+  ctx.deps.state.datasets = datasets
+  return StateSnapshotEvent(
+    type=EventType.STATE_SNAPSHOT,
+    snapshot=ctx.deps.state,
+  )
+
+
+@agent.tool
+def get_weather(_: RunContext[StateDeps[MLState]], location: str) -> str:
   """Get the weather for a given location. Ensure location is fully spelled out."""
   return f"The weather in {location} is sunny."

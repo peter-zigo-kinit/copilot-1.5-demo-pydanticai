@@ -10,4 +10,6 @@ dependencies = [
     "python-dotenv",
     "logfire>=4.10.0",
     "fastapi>=0.128.2",
+    "sqlmodel",
+    "psycopg[binary]",
 ]

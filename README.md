@@ -68,6 +68,43 @@ bun run dev
 
 This will start both the UI and agent servers concurrently.
 
+## Database (Postgres 17.6)
+
+Run Postgres locally with Docker:
+
+```bash
+docker run --name copilotkit-db \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_DB=copilotkit \
+  -p 5432:5432 \
+  -d postgres:17.6
+```
+
+The agent defaults to:
+
+```
+postgresql+psycopg://postgres:postgres@localhost:5432/copilotkit
+```
+
+Override with `DATABASE_URL` if needed.
+
+## Seed the Database
+
+Seed demo ML threads and state:
+
+```bash
+cd agent
+uv run src/seed.py
+```
+
+Seed from scratch (drop all tables first):
+
+```bash
+cd agent
+uv run src/seed.py --drop-all
+```
+
 ## Available Scripts
 The following scripts can also be run using your preferred package manager:
 - `dev` - Starts both UI and agent servers in development mode
