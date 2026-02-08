@@ -19,7 +19,7 @@ from pydantic_ai.ui.ag_ui._adapter import AGUIAdapter
 
 from agent import MLState, StateDeps, agent
 from db import engine
-from models import Message, State, Thread, ThreadMetadata
+from models import Message, State, Thread
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("threads")
@@ -153,25 +153,6 @@ async def ag_ui_endpoint(request: Request) -> StreamingResponse:
     state_row = session.exec(select(State).where(State.thread_id == thread.id)).first()
     stored_state = state_row.state_json if state_row else MLState().model_dump()
 
-    metadata = thread.thread_metadata or ThreadMetadata()
-    known_ids = set((metadata.custom_data or {}).get("known_message_ids", []))
-    new_agui_messages = [message for message in run_input.messages if message.id not in known_ids]
-    if new_agui_messages:
-        known_ids.update(message.id for message in new_agui_messages)
-        metadata.custom_data = {
-            **(metadata.custom_data or {}),
-            "known_message_ids": list(known_ids),
-        }
-        thread.thread_metadata = metadata
-        session.add(thread)
-        session.commit()
-        logger.info(
-            "Thread %s received %s new messages (known=%s)",
-            run_input.thread_id,
-            len(new_agui_messages),
-            len(known_ids),
-        )
-
     stored_messages = session.exec(
         select(Message).where(Message.thread_id == thread.id).order_by(Message.created_at)
     ).all()
@@ -179,10 +160,14 @@ async def ag_ui_endpoint(request: Request) -> StreamingResponse:
         ModelMessageAdapter.validate_python(message.message_json)
         for message in stored_messages
     ]
-    message_history = model_messages
-    if new_agui_messages:
-        incoming_messages = AGUIAdapter.load_messages(new_agui_messages)
-        message_history = [*model_messages, *incoming_messages]
+    stored_agui_count = len(_model_messages_to_chat(model_messages, str(thread.id)))
+    if run_input.messages and len(run_input.messages) >= stored_agui_count:
+        new_agui_messages = run_input.messages[stored_agui_count:]
+    else:
+        new_agui_messages = run_input.messages
+
+    incoming_messages = AGUIAdapter.load_messages(new_agui_messages) if new_agui_messages else []
+    message_history = [*model_messages, *incoming_messages]
 
     run_input = run_input.model_copy(update={"messages": new_agui_messages})
 
